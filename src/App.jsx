@@ -1,13 +1,13 @@
 import React, { useState, useEffect, useCallback } from "react";
+import { createClient } from "@supabase/supabase-js";
+
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
-const getSupabase = () => {
-  if (typeof window !== "undefined" && window.supabase && SUPABASE_URL) {
-    return window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-  }
-  return null;
-};
 
+const supabase =
+  SUPABASE_URL && SUPABASE_ANON_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+    : null;
 // --- Constants & Dictionary ---
 const DICTIONARY = {
   4: [
@@ -259,27 +259,29 @@ export default function App() {
     }
   };
 
-const createChallenge = async () => {
-  const client = supabase;
-  if (!client) {
-    showToast("تأكد من وضع مفاتيح Supabase في .env وبادئة VITE_");
-    return;
-  }
+  const createChallenge = async () => {
+    const client = supabase;
+    if (!client) {
+      showToast("تأكد من وضع مفاتيح Supabase في .env وبادئة VITE_");
+      return;
+    }
 
-  const id = Math.random().toString(36).substring(2, 8);
+    const id = Math.random().toString(36).substring(2, 8);
 
-  const { error } = await client
-    .from("challenges")
-    .insert([{ id, word: targetWord, length: currentWordLength }]);
+    const { error } = await client
+      .from("challenges")
+      .insert([{ id, word: targetWord, length: currentWordLength }]);
 
-  if (error) {
-    showToast("فشل إنشاء التحدي!");
-    return;
-  }
+    if (error) {
+      showToast("فشل إنشاء التحدي!");
+      return;
+    }
 
-  setChallengeLink(`${window.location.origin}${window.location.pathname}?c=${id}`);
-  setShowChallengeModal(true);
-};
+    setChallengeLink(
+      `${window.location.origin}${window.location.pathname}?c=${id}`,
+    );
+    setShowChallengeModal(true);
+  };
 
   if (isLoading) {
     return (
