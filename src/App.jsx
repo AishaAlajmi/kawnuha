@@ -153,6 +153,7 @@ const genId = (len = 10) =>
   Math.random()
     .toString(36)
     .slice(2, 2 + len);
+
 const nowSec = () => Math.floor(Date.now() / 1000);
 
 export default function App() {
@@ -183,7 +184,12 @@ export default function App() {
   const [players, setPlayers] = useState([]);
   const [results, setResults] = useState([]);
 
-  // Phases: "solo" | "lobby" | "countdown" | "playing" | "finished"
+  // ✅ لازم تكون هنا (قبل أي useMemo/return)
+  const [matchScores, setMatchScores] = useState([]); // [{player_id,name,wins}]
+  const [roundWinner, setRoundWinner] = useState(null); // {player_id,name}
+  const [matchWinner, setMatchWinner] = useState(null); // {player_id,name}
+
+  // Phases: "solo" | "lobby" | "countdown" | "playing" | "finished" | "round_over" | "match_over"
   const [phase, setPhase] = useState("solo");
 
   // Race mode
@@ -244,7 +250,7 @@ export default function App() {
   // ====== Detect challenge from URL (?c=...&h=...) ======
   useEffect(() => {
     const urlParams = new URLSearchParams(
-      typeof window !== "undefined" ? window.location.search : "",
+      typeof window !== "undefined" ? window.location.search : ""
     );
     const c = urlParams.get("c");
     const h = urlParams.get("h");
@@ -273,8 +279,8 @@ export default function App() {
 
   const calcScore = (won, tries, durationSec) => {
     if (!won) return 0;
-    const base = Math.max(0, 7 - tries) * 10; // مثل عندك
-    const speedBonus = Math.max(0, 20 - Math.floor(durationSec / 10)); // سريع = بونص
+    const base = Math.max(0, 7 - tries) * 10;
+    const speedBonus = Math.max(0, 20 - Math.floor(durationSec / 10));
     return base + speedBonus;
   };
 
@@ -314,7 +320,7 @@ export default function App() {
         name: name || "لاعب",
       });
     },
-    [playerId],
+    [playerId]
   );
 
   const fetchPlayers = useCallback(async (cId) => {
@@ -336,11 +342,11 @@ export default function App() {
       .select("*")
       .eq("challenge_id", cId)
       .eq("round", round)
-      .order("won", { ascending: true }) // won true first? (supabase order uses ascending)
+      .order("won", { ascending: true })
       .order("tries", { ascending: true })
       .order("duration_sec", { ascending: true })
       .order("score", { ascending: false });
-    // Fix won order manually (since true/false ordering can vary)
+
     const arr = (data || []).slice().sort((a, b) => {
       if (a.won !== b.won) return a.won ? -1 : 1;
       if (a.tries !== b.tries) return a.tries - b.tries;
@@ -350,26 +356,28 @@ export default function App() {
     });
     return arr;
   }, []);
-const fetchMatchScores = useCallback(async (cId) => {
-  const client = supabase;
-  if (!client) return [];
 
-  const { data } = await client
-    .from("challenge_results")
-    .select("player_id,name,is_round_winner")
-    .eq("challenge_id", cId);
+  const fetchMatchScores = useCallback(async (cId) => {
+    const client = supabase;
+    if (!client) return [];
 
-  const wins = new Map();
-  (data || []).forEach((r) => {
-    if (!r.is_round_winner) return;
-    const key = r.player_id;
-    const cur = wins.get(key) || { player_id: key, name: r.name, wins: 0 };
-    cur.wins += 1;
-    wins.set(key, cur);
-  });
+    const { data } = await client
+      .from("challenge_results")
+      .select("player_id,name,is_round_winner")
+      .eq("challenge_id", cId);
 
-  return Array.from(wins.values()).sort((a, b) => b.wins - a.wins);
-}, []);
+    const wins = new Map();
+    (data || []).forEach((r) => {
+      if (!r.is_round_winner) return;
+      const key = r.player_id;
+      const cur = wins.get(key) || { player_id: key, name: r.name, wins: 0 };
+      cur.wins += 1;
+      wins.set(key, cur);
+    });
+
+    return Array.from(wins.values()).sort((a, b) => b.wins - a.wins);
+  }, []);
+
   const resetBoard = () => {
     setGuesses([]);
     setCurrentGuess("");
@@ -390,6 +398,9 @@ const fetchMatchScores = useCallback(async (cId) => {
         setResults([]);
         setSessionRound(1);
         setSessionScore(0);
+        setRoundWinner(null);
+        setMatchWinner(null);
+        setMatchScores([]);
         startSoloGame(currentWordLength);
         setIsLoading(false);
         return;
@@ -409,10 +420,24 @@ const fetchMatchScores = useCallback(async (cId) => {
       setSessionRound(c.current_round);
       resetBoard();
 
-      // lobby or running?
+      // status -> phase
       if (c.status === "lobby") setPhase("lobby");
       if (c.status === "running") setPhase("playing");
-      if (c.status === "finished") setPhase("finished");
+      if (c.status === "round_over") setPhase("round_over");
+      if (c.status === "match_over") setPhase("match_over");
+      if (c.status === "finished") setPhase("finished"); // احتياط لو عندك قيم قديمة
+
+      // winners
+      setRoundWinner(
+        c.round_winner_player_id
+          ? { player_id: c.round_winner_player_id, name: c.round_winner_name }
+          : null
+      );
+      setMatchWinner(
+        c.match_winner_player_id
+          ? { player_id: c.match_winner_player_id, name: c.match_winner_name }
+          : null
+      );
 
       // Join
       if (playerId) await joinChallenge(challengeId, playerName || "لاعب");
@@ -422,6 +447,10 @@ const fetchMatchScores = useCallback(async (cId) => {
 
       const res = await fetchResults(challengeId, c.current_round);
       setResults(res);
+
+      // match scores (سلسلة الفوز)
+      const ms = await fetchMatchScores(challengeId);
+      setMatchScores(ms);
 
       // race timer
       if (c.starts_at) {
@@ -453,7 +482,7 @@ const fetchMatchScores = useCallback(async (cId) => {
           table: "challenge_players",
           filter: `challenge_id=eq.${challengeId}`,
         },
-        async () => setPlayers(await fetchPlayers(challengeId)),
+        async () => setPlayers(await fetchPlayers(challengeId))
       )
       .on(
         "postgres_changes",
@@ -466,7 +495,8 @@ const fetchMatchScores = useCallback(async (cId) => {
         async () => {
           const round = challengeData?.current_round || sessionRound;
           setResults(await fetchResults(challengeId, round));
-        },
+          setMatchScores(await fetchMatchScores(challengeId));
+        }
       )
       .on(
         "postgres_changes",
@@ -478,57 +508,58 @@ const fetchMatchScores = useCallback(async (cId) => {
         },
         async (payload) => {
           const c = payload.new;
-          // status switch
-if (c.status === "lobby") setPhase("lobby");
-if (c.status === "running") setPhase("playing");
-if (c.status === "round_over") setPhase("round_over");
-if (c.status === "match_over") setPhase("match_over");
 
-// winners
-if (c.round_winner_player_id) {
-  setRoundWinner({ player_id: c.round_winner_player_id, name: c.round_winner_name });
-}
-if (c.match_winner_player_id) {
-  setMatchWinner({ player_id: c.match_winner_player_id, name: c.match_winner_name });
-}
-
-// عند تغيير الراوند/الكلمة
-setSessionRound(c.current_round);
-resetBoard();
-startedAtRef.current = Date.now();
           setChallengeData(c);
           setCurrentWordLength(c.length);
           setTargetWord(c.word);
 
-          // round changed => reset board
+          // status -> phase
+          if (c.status === "lobby") setPhase("lobby");
+          if (c.status === "running") setPhase("playing");
+          if (c.status === "round_over") setPhase("round_over");
+          if (c.status === "match_over") setPhase("match_over");
+          if (c.status === "finished") setPhase("finished");
+
+          // winners
+          setRoundWinner(
+            c.round_winner_player_id
+              ? { player_id: c.round_winner_player_id, name: c.round_winner_name }
+              : null
+          );
+          setMatchWinner(
+            c.match_winner_player_id
+              ? { player_id: c.match_winner_player_id, name: c.match_winner_name }
+              : null
+          );
+
+          // starts_at
+          setRaceStartAtSec(
+            c.starts_at ? Math.floor(new Date(c.starts_at).getTime() / 1000) : null
+          );
+
+          // round changed -> reset board
           setSessionRound(c.current_round);
           resetBoard();
           startedAtRef.current = Date.now();
 
-          // status switch
-          if (c.status === "lobby") setPhase("lobby");
-          if (c.status === "running") setPhase("playing");
-          if (c.status === "finished") setPhase("finished");
-
-          // starts_at
-          if (c.starts_at) {
-            setRaceStartAtSec(
-              Math.floor(new Date(c.starts_at).getTime() / 1000),
-            );
-          } else {
-            setRaceStartAtSec(null);
-          }
-
-          // refresh results for new round
+          // refresh results
           setResults(await fetchResults(challengeId, c.current_round));
-        },
+          setMatchScores(await fetchMatchScores(challengeId));
+        }
       )
       .subscribe();
 
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [challengeId, fetchPlayers, fetchResults, challengeData, sessionRound]);
+  }, [
+    challengeId,
+    fetchPlayers,
+    fetchResults,
+    fetchMatchScores,
+    challengeData,
+    sessionRound,
+  ]);
 
   // ====== Race countdown tick ======
   useEffect(() => {
@@ -545,7 +576,6 @@ startedAtRef.current = Date.now();
         setPhase("countdown");
       } else {
         setRaceCountdown(0);
-        // auto start play
         if (challengeData?.status === "running") setPhase("playing");
       }
     };
@@ -559,7 +589,15 @@ startedAtRef.current = Date.now();
   const handleKeyPress = useCallback(
     (key) => {
       if (gameOver) return;
-if (phase === "lobby" || phase === "countdown" || phase === "round_over" || phase === "match_over") return;        return;
+      // ✅ إصلاح return المكرر + منع اللعب في round/match over
+      if (
+        phase === "lobby" ||
+        phase === "countdown" ||
+        phase === "round_over" ||
+        phase === "match_over" ||
+        phase === "finished"
+      )
+        return;
 
       if (key === "BACK" || key === "Backspace") {
         setCurrentGuess((prev) => prev.slice(0, -1));
@@ -589,7 +627,7 @@ if (phase === "lobby" || phase === "countdown" || phase === "round_over" || phas
         setCurrentGuess((prev) => prev + key);
       }
     },
-    [gameOver, phase, currentGuess, currentWordLength, guesses, targetWord],
+    [gameOver, phase, currentGuess, currentWordLength, guesses, targetWord]
   );
 
   useEffect(() => {
@@ -601,80 +639,87 @@ if (phase === "lobby" || phase === "countdown" || phase === "round_over" || phas
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [handleKeyPress]);
 
-useEffect(() => {
-  const submit = async () => {
-    if (!gameOver) return;
-    if (!challengeId || !supabase) return;
+  // ====== When game ends in challenge => submit result + close round if first winner ======
+  useEffect(() => {
+    const submit = async () => {
+      if (!gameOver) return;
+      if (!challengeId || !supabase) return;
 
-    const finishedAt = Date.now();
-    const durationSec = Math.max(1, Math.floor((finishedAt - (startedAtRef.current || finishedAt)) / 1000));
-    const tries = win ? guesses.length : 6;
-    const score = calcScore(win, tries, durationSec);
-    const round = challengeData?.current_round || sessionRound;
+      const finishedAt = Date.now();
+      const durationSec = Math.max(
+        1,
+        Math.floor((finishedAt - (startedAtRef.current || finishedAt)) / 1000)
+      );
+      const tries = win ? guesses.length : 6;
+      const score = calcScore(win, tries, durationSec);
+      const round = challengeData?.current_round || sessionRound;
 
-    // 1) ارفع نتيجتي (مبدئيًا بدون is_round_winner)
-    await supabase.from("challenge_results").upsert({
-      challenge_id: challengeId,
-      round,
-      player_id: playerId,
-      name: playerName || "لاعب",
-      tries,
-      won: !!win,
-      duration_sec: durationSec,
-      score,
-      is_round_winner: false
-    });
+      // ارفع نتيجتي
+      await supabase.from("challenge_results").upsert({
+        challenge_id: challengeId,
+        round,
+        player_id: playerId,
+        name: playerName || "لاعب",
+        tries,
+        won: !!win,
+        duration_sec: durationSec,
+        score,
+        is_round_winner: false,
+      });
 
-    // 2) لو أنا فزت بالكلمة: أحاول أكون "أول واحد" يقفل الراوند
-    if (win) {
-      const { data: updated } = await supabase
-        .from("challenges")
-        .update({
-          round_winner_player_id: playerId,
-          round_winner_name: playerName || "لاعب",
-          round_ended_at: new Date().toISOString()
-        })
-        .eq("id", challengeId)
-        .is("round_winner_player_id", null)   // شرط: ما فيه فائز قبلي
-        .eq("status", "running")              // شرط: الراوند شغال
-        .select()
-        .maybeSingle();
+      // لو فزت بالكلمة: حاول اقفل الراوند كأول واحد
+      if (win) {
+        const { data: updated } = await supabase
+          .from("challenges")
+          .update({
+            round_winner_player_id: playerId,
+            round_winner_name: playerName || "لاعب",
+            round_ended_at: new Date().toISOString(),
+          })
+          .eq("id", challengeId)
+          .is("round_winner_player_id", null)
+          .eq("status", "running")
+          .select()
+          .maybeSingle();
 
-      // إذا أنا فعلاً أول واحد (تم التحديث)
-      if (updated) {
-        // علّم نتيجتي كفائز الراوند
-        await supabase
-          .from("challenge_results")
-          .update({ is_round_winner: true })
-          .eq("challenge_id", challengeId)
-          .eq("round", round)
-          .eq("player_id", playerId);
+        // إذا أنا فعلاً أول واحد
+        if (updated) {
+          await supabase
+            .from("challenge_results")
+            .update({ is_round_winner: true })
+            .eq("challenge_id", challengeId)
+            .eq("round", round)
+            .eq("player_id", playerId);
 
-        // تحقق إذا وصلت 5 فوز -> نهاية المباراة
-        const scores = await fetchMatchScores(challengeId);
-        const me = scores.find(s => s.player_id === playerId);
-        const target = updated.match_target_wins || 5;
+          const scores = await fetchMatchScores(challengeId);
+          setMatchScores(scores);
 
-        if ((me?.wins || 0) >= target) {
-          await supabase.from("challenges").update({
-            status: "match_over",
-            match_winner_player_id: playerId,
-            match_winner_name: playerName || "لاعب"
-          }).eq("id", challengeId);
-        } else {
-          // غير كذا: خلّي الراوند ينتهي ويعرض للكل
-          await supabase.from("challenges").update({ status: "round_over" }).eq("id", challengeId);
+          const me = scores.find((s) => s.player_id === playerId);
+          const target = updated.match_target_wins || 5;
+
+          if ((me?.wins || 0) >= target) {
+            await supabase
+              .from("challenges")
+              .update({
+                status: "match_over",
+                match_winner_player_id: playerId,
+                match_winner_name: playerName || "لاعب",
+              })
+              .eq("id", challengeId);
+          } else {
+            await supabase
+              .from("challenges")
+              .update({ status: "round_over" })
+              .eq("id", challengeId);
+          }
         }
       }
-    } else {
-      // لو خسرت، نخلي الراوند يستنى الفائز الحقيقي (أول واحد حل)
-      // وما نغير status هنا
-    }
-  };
+    };
 
-  submit();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-}, [gameOver]);
+    submit();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gameOver]);
+
   // ====== Create challenge ======
   const createChallenge = async () => {
     const client = supabase;
@@ -688,7 +733,7 @@ useEffect(() => {
     }
 
     const id = genId(7);
-    const hk = genId(10); // host key hidden in link
+    const hk = genId(10);
 
     const { error } = await client.from("challenges").insert([
       {
@@ -715,13 +760,12 @@ useEffect(() => {
     setChallengeLink(link);
     setShowChallengeModal(true);
 
-    // navigate to challenge
     window.history.replaceState({}, document.title, `?c=${id}&h=${hk}`);
     setChallengeId(id);
     setHostKey(hk);
   };
 
-  // ====== Host actions: Start race / Rematch ======
+  // ====== Host actions ======
   const isHost = useMemo(() => {
     if (!challengeData || !hostKey) return false;
     return challengeData.host_key === hostKey;
@@ -733,7 +777,6 @@ useEffect(() => {
       showToast("فقط المضيف يقدر يبدأ السباق 👑");
       return;
     }
-    // start in 5 seconds
     const startAt = new Date(Date.now() + 5000).toISOString();
     await supabase
       .from("challenges")
@@ -741,27 +784,31 @@ useEffect(() => {
       .eq("id", challengeId);
   };
 
-const nextRoundSameLink = async () => {
-  if (!challengeId || !supabase) return;
-  if (!isHost) return showToast("فقط المضيف 👑");
+  // ✅ بدل rematchSameLink (نفس الرابط لكن راوند جديد)
+  const nextRoundSameLink = async () => {
+    if (!challengeId || !supabase) return;
+    if (!isHost) return showToast("فقط المضيف 👑");
 
-  const len = challengeData?.length || currentWordLength;
-  const list = DICTIONARY[len];
-  const newWord = list[Math.floor(Math.random() * list.length)];
+    const len = challengeData?.length || currentWordLength;
+    const list = DICTIONARY[len];
+    const newWord = list[Math.floor(Math.random() * list.length)];
 
-  await supabase.from("challenges").update({
-    word: newWord,
-    length: len,
-    status: "lobby",
-    starts_at: null,
-    current_round: (challengeData?.current_round || sessionRound) + 1,
-    round_winner_player_id: null,
-    round_winner_name: null,
-    round_ended_at: null
-  }).eq("id", challengeId);
+    await supabase
+      .from("challenges")
+      .update({
+        word: newWord,
+        length: len,
+        status: "lobby",
+        starts_at: null,
+        current_round: (challengeData?.current_round || sessionRound) + 1,
+        round_winner_player_id: null,
+        round_winner_name: null,
+        round_ended_at: null,
+      })
+      .eq("id", challengeId);
 
-  showToast("راوند جديد جاهز 🔁");
-};
+    showToast("راوند جديد جاهز 🔁");
+  };
 
   // ====== Solo length change behavior ======
   useEffect(() => {
@@ -780,9 +827,7 @@ const nextRoundSameLink = async () => {
       return b.score - a.score;
     });
   }, [results]);
-const [matchScores, setMatchScores] = useState([]); // [{player_id,name,wins}]
-const [roundWinner, setRoundWinner] = useState(null); // {player_id,name}
-const [matchWinner, setMatchWinner] = useState(null); // {player_id,name}
+
   // ====== UI render guards ======
   if (isLoading) {
     return (
@@ -824,7 +869,6 @@ const [matchWinner, setMatchWinner] = useState(null); // {player_id,name}
           </h1>
 
           <div className="flex items-center gap-2">
-            {/* Player name */}
             <input
               value={playerName}
               onChange={(e) => saveName(e.target.value)}
@@ -932,7 +976,11 @@ const [matchWinner, setMatchWinner] = useState(null); // {player_id,name}
                     <button
                       onClick={startRaceNow}
                       className={`py-3 rounded-2xl font-black border-none cursor-pointer transition-transform active:scale-95
-                        ${isHost ? "bg-gradient-to-r from-emerald-500 to-teal-600" : "bg-slate-700/60 text-slate-300"}`}
+                        ${
+                          isHost
+                            ? "bg-gradient-to-r from-emerald-500 to-teal-600"
+                            : "bg-slate-700/60 text-slate-300"
+                        }`}
                     >
                       بدء سباق الوقت ⏱️
                     </button>
@@ -940,7 +988,7 @@ const [matchWinner, setMatchWinner] = useState(null); // {player_id,name}
                     <button
                       onClick={() =>
                         copyToClipboard(window.location.href).then(() =>
-                          showToast("تم نسخ رابط التحدي!"),
+                          showToast("تم نسخ رابط التحدي!")
                         )
                       }
                       className="py-3 rounded-2xl font-black bg-slate-900 border border-slate-700 cursor-pointer"
@@ -1012,12 +1060,12 @@ const [matchWinner, setMatchWinner] = useState(null); // {player_id,name}
                           status === "correct"
                             ? "bg-[#10b981] border-[#10b981] shadow-[0_0_15px_rgba(16,185,129,0.4)]"
                             : status === "present"
-                              ? "bg-[#f59e0b] border-[#f59e0b] shadow-[0_0_15px_rgba(245,158,11,0.4)]"
-                              : status === "absent"
-                                ? "bg-[#475569] border-[#475569] opacity-60"
-                                : char
-                                  ? "border-blue-400 bg-blue-400/10 scale-105"
-                                  : "border-[#334155] bg-white/5"
+                            ? "bg-[#f59e0b] border-[#f59e0b] shadow-[0_0_15px_rgba(245,158,11,0.4)]"
+                            : status === "absent"
+                            ? "bg-[#475569] border-[#475569] opacity-60"
+                            : char
+                            ? "border-blue-400 bg-blue-400/10 scale-105"
+                            : "border-[#334155] bg-white/5"
                         }`}
                     >
                       {char}
@@ -1028,7 +1076,144 @@ const [matchWinner, setMatchWinner] = useState(null); // {player_id,name}
             </div>
           )}
 
-          {/* FINISHED: Leaderboard */}
+          {/* ✅ ROUND OVER */}
+          {inChallenge && phase === "round_over" && (
+            <div className="bg-slate-900/60 border border-slate-700 rounded-3xl p-6 shadow-2xl mt-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="text-sm text-slate-400">انتهى الراوند</div>
+                  <div className="text-2xl font-black text-white mt-1">
+                    الفائز:{" "}
+                    <span className="text-emerald-300">
+                      {roundWinner?.name || "—"}
+                    </span>
+                  </div>
+                </div>
+                <div className="text-right">
+                  <div className="text-xs text-slate-400">الجولة</div>
+                  <div className="text-sm font-black text-purple-300">
+                    #{sessionRound}
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-4">
+                <div className="text-xs text-slate-400 mb-2">ترتيب الراوند</div>
+                <div className="space-y-2">
+                  {leaderboard.map((r, idx) => (
+                    <div
+                      key={r.player_id}
+                      className={`flex items-center justify-between rounded-2xl px-4 py-3 border
+                        ${
+                          idx === 0
+                            ? "bg-emerald-500/10 border-emerald-500/30"
+                            : "bg-slate-800/60 border-slate-700"
+                        }`}
+                    >
+                      <span className="font-bold text-white">
+                        {idx + 1}. {r.name}
+                      </span>
+                      <span className="text-slate-300 text-sm">
+                        {r.won ? `✅ ${r.tries} محاولات` : "❌"}
+                      </span>
+                    </div>
+                  ))}
+                  {leaderboard.length === 0 && (
+                    <div className="text-slate-500 text-sm">
+                      بانتظار النتائج...
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="mt-4">
+                <div className="text-xs text-slate-400 mb-2">سلسلة الفوز</div>
+                <div className="space-y-2">
+                  {(matchScores || []).map((s) => (
+                    <div
+                      key={s.player_id}
+                      className="flex items-center justify-between bg-slate-800/60 border border-slate-700 rounded-2xl px-4 py-3"
+                    >
+                      <span className="font-bold text-white">{s.name}</span>
+                      <span className="text-purple-300 font-black">
+                        {s.wins}
+                      </span>
+                    </div>
+                  ))}
+                  {(matchScores || []).length === 0 && (
+                    <div className="text-slate-500 text-sm">
+                      لا توجد نقاط سلسلة بعد
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {isHost && (
+                <button
+                  onClick={nextRoundSameLink}
+                  className="mt-4 w-full py-3 rounded-2xl font-black bg-gradient-to-r from-indigo-500 to-purple-600 border-none cursor-pointer"
+                >
+                  الراوند التالي 🔁
+                </button>
+              )}
+
+              {!isHost && (
+                <div className="text-[11px] text-slate-400 text-center mt-3">
+                  انتظر المضيف يبدأ الراوند التالي 👑
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ✅ MATCH OVER */}
+          {inChallenge && phase === "match_over" && (
+            <div className="bg-slate-900/60 border border-slate-700 rounded-3xl p-6 shadow-2xl mt-4 text-center">
+              <div className="text-sm text-slate-400">انتهت المباراة</div>
+              <div className="text-3xl font-black text-white mt-2">
+                🏆 الفائز النهائي:{" "}
+                <span className="text-emerald-300">
+                  {matchWinner?.name || "—"}
+                </span>
+              </div>
+
+              <div className="mt-4 text-left">
+                <div className="text-xs text-slate-400 mb-2">سلسلة الفوز</div>
+                <div className="space-y-2">
+                  {(matchScores || []).map((s, idx) => (
+                    <div
+                      key={s.player_id}
+                      className={`flex items-center justify-between rounded-2xl px-4 py-3 border
+                        ${
+                          idx === 0
+                            ? "bg-emerald-500/10 border-emerald-500/30"
+                            : "bg-slate-800/60 border-slate-700"
+                        }`}
+                    >
+                      <span className="font-bold text-white">
+                        {idx + 1}. {s.name}
+                      </span>
+                      <span className="text-purple-300 font-black">
+                        {s.wins}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <button
+                onClick={() =>
+                  copyToClipboard(window.location.href).then(() =>
+                    showToast("تم نسخ رابط التحدي!")
+                  )
+                }
+                className="mt-5 bg-slate-900 py-3 w-full rounded-2xl border border-slate-700 font-black text-white cursor-pointer"
+              >
+                نسخ الرابط 🔗
+              </button>
+            </div>
+          )}
+
+          {/* FINISHED: Leaderboard (موجود مثل ما هو - احتياطي) */}
           {inChallenge && phase === "finished" && (
             <div className="bg-slate-900/60 border border-slate-700 rounded-3xl p-6 shadow-2xl">
               <div className="flex items-center justify-between">
@@ -1057,12 +1242,20 @@ const [matchWinner, setMatchWinner] = useState(null); // {player_id,name}
                   <div
                     key={r.player_id}
                     className={`flex items-center justify-between rounded-2xl px-4 py-3 border
-                      ${idx === 0 ? "bg-emerald-500/10 border-emerald-500/30" : "bg-slate-800/60 border-slate-700"}`}
+                      ${
+                        idx === 0
+                          ? "bg-emerald-500/10 border-emerald-500/30"
+                          : "bg-slate-800/60 border-slate-700"
+                      }`}
                   >
                     <div className="flex items-center gap-3">
                       <div
                         className={`w-9 h-9 rounded-xl flex items-center justify-center font-black
-                        ${idx === 0 ? "bg-emerald-500 text-slate-950" : "bg-slate-700 text-white"}`}
+                        ${
+                          idx === 0
+                            ? "bg-emerald-500 text-slate-950"
+                            : "bg-slate-700 text-white"
+                        }`}
                       >
                         {idx + 1}
                       </div>
@@ -1099,7 +1292,7 @@ const [matchWinner, setMatchWinner] = useState(null); // {player_id,name}
                 <button
                   onClick={() =>
                     copyToClipboard(window.location.href).then(() =>
-                      showToast("تم نسخ رابط التحدي!"),
+                      showToast("تم نسخ رابط التحدي!")
                     )
                   }
                   className="bg-slate-900 py-3 rounded-2xl border border-slate-700 font-black text-white cursor-pointer"
@@ -1108,16 +1301,20 @@ const [matchWinner, setMatchWinner] = useState(null); // {player_id,name}
                 </button>
 
                 <button
-                  onClick={rematchSameLink}
+                  onClick={nextRoundSameLink}
                   className={`py-3 rounded-2xl font-black border-none cursor-pointer transition-transform active:scale-95
-                    ${isHost ? "bg-gradient-to-r from-indigo-500 to-purple-600" : "bg-slate-700/60 text-slate-300"}`}
+                    ${
+                      isHost
+                        ? "bg-gradient-to-r from-indigo-500 to-purple-600"
+                        : "bg-slate-700/60 text-slate-300"
+                    }`}
                 >
-                  إعادة التحدي (نفس الرابط) 🔁
+                  الراوند التالي (نفس الرابط) 🔁
                 </button>
 
                 {!isHost && (
                   <div className="text-[11px] text-slate-400 text-center">
-                    فقط المضيف يقدر يبدأ “إعادة التحدي” 👑
+                    فقط المضيف يقدر يبدأ الراوند التالي 👑
                   </div>
                 )}
               </div>
@@ -1154,12 +1351,12 @@ const [matchWinner, setMatchWinner] = useState(null); // {player_id,name}
                       key === "ENTER" || key === "BACK"
                         ? "flex-[1.5] bg-[#475569]"
                         : keyStatus === "correct"
-                          ? "bg-[#10b981]"
-                          : keyStatus === "present"
-                            ? "bg-[#f59e0b]"
-                            : keyStatus === "absent"
-                              ? "bg-[#1e293b] opacity-40"
-                              : "bg-[#334155]"
+                        ? "bg-[#10b981]"
+                        : keyStatus === "present"
+                        ? "bg-[#f59e0b]"
+                        : keyStatus === "absent"
+                        ? "bg-[#1e293b] opacity-40"
+                        : "bg-[#334155]"
                     }`}
                 >
                   {key === "BACK" ? "⌫" : key === "ENTER" ? "دخول" : key}
@@ -1209,14 +1406,14 @@ const [matchWinner, setMatchWinner] = useState(null); // {player_id,name}
                             r === "correct"
                               ? "🟩"
                               : r === "present"
-                                ? "🟨"
-                                : "⬛",
+                              ? "🟨"
+                              : "⬛"
                           )
-                          .join(""),
+                          .join("")
                       )
                       .join("\n");
                   copyToClipboard(text).then(() =>
-                    showToast("تم نسخ النتيجة!"),
+                    showToast("تم نسخ النتيجة!")
                   );
                 }}
                 className="bg-slate-800 py-3 px-6 rounded-2xl border border-slate-600 font-bold text-white cursor-pointer transition-transform hover:scale-105"
@@ -1236,7 +1433,7 @@ const [matchWinner, setMatchWinner] = useState(null); // {player_id,name}
               أنشئ تحدي لصديقك ⚔️
             </h2>
             <p className="text-slate-400 text-sm mb-6">
-              الرابط يحتوي صلاحية المضيف 👑 (للبدء/إعادة التحدي)
+              الرابط يحتوي صلاحية المضيف 👑 (للبدء/الراوند التالي)
             </p>
             <input
               readOnly
@@ -1248,7 +1445,7 @@ const [matchWinner, setMatchWinner] = useState(null); // {player_id,name}
               <button
                 onClick={() => {
                   copyToClipboard(challengeLink).then(() =>
-                    showToast("تم نسخ الرابط!"),
+                    showToast("تم نسخ الرابط!")
                   );
                 }}
                 className="bg-purple-600 py-3 px-6 rounded-2xl font-bold hover:bg-purple-500 transition-colors text-white border-none cursor-pointer"
