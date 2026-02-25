@@ -350,7 +350,26 @@ export default function App() {
     });
     return arr;
   }, []);
+const fetchMatchScores = useCallback(async (cId) => {
+  const client = supabase;
+  if (!client) return [];
 
+  const { data } = await client
+    .from("challenge_results")
+    .select("player_id,name,is_round_winner")
+    .eq("challenge_id", cId);
+
+  const wins = new Map();
+  (data || []).forEach((r) => {
+    if (!r.is_round_winner) return;
+    const key = r.player_id;
+    const cur = wins.get(key) || { player_id: key, name: r.name, wins: 0 };
+    cur.wins += 1;
+    wins.set(key, cur);
+  });
+
+  return Array.from(wins.values()).sort((a, b) => b.wins - a.wins);
+}, []);
   const resetBoard = () => {
     setGuesses([]);
     setCurrentGuess("");
@@ -459,6 +478,24 @@ export default function App() {
         },
         async (payload) => {
           const c = payload.new;
+          // status switch
+if (c.status === "lobby") setPhase("lobby");
+if (c.status === "running") setPhase("playing");
+if (c.status === "round_over") setPhase("round_over");
+if (c.status === "match_over") setPhase("match_over");
+
+// winners
+if (c.round_winner_player_id) {
+  setRoundWinner({ player_id: c.round_winner_player_id, name: c.round_winner_name });
+}
+if (c.match_winner_player_id) {
+  setMatchWinner({ player_id: c.match_winner_player_id, name: c.match_winner_name });
+}
+
+// عند تغيير الراوند/الكلمة
+setSessionRound(c.current_round);
+resetBoard();
+startedAtRef.current = Date.now();
           setChallengeData(c);
           setCurrentWordLength(c.length);
           setTargetWord(c.word);
@@ -522,8 +559,7 @@ export default function App() {
   const handleKeyPress = useCallback(
     (key) => {
       if (gameOver) return;
-      if (phase === "lobby" || phase === "countdown" || phase === "finished")
-        return;
+if (phase === "lobby" || phase === "countdown" || phase === "round_over" || phase === "match_over") return;        return;
 
       if (key === "BACK" || key === "Backspace") {
         setCurrentGuess((prev) => prev.slice(0, -1));
@@ -565,55 +601,80 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [handleKeyPress]);
 
-  // ====== When game ends in challenge => auto submit result + show leaderboard ======
-  useEffect(() => {
-    const submit = async () => {
-      if (!gameOver) return;
-      if (!challengeId || !supabase) return;
+useEffect(() => {
+  const submit = async () => {
+    if (!gameOver) return;
+    if (!challengeId || !supabase) return;
 
-      const finishedAt = Date.now();
-      const durationSec = Math.max(
-        1,
-        Math.floor((finishedAt - (startedAtRef.current || finishedAt)) / 1000),
-      );
-      const tries = win ? guesses.length : 6;
-      const score = calcScore(win, tries, durationSec);
+    const finishedAt = Date.now();
+    const durationSec = Math.max(1, Math.floor((finishedAt - (startedAtRef.current || finishedAt)) / 1000));
+    const tries = win ? guesses.length : 6;
+    const score = calcScore(win, tries, durationSec);
+    const round = challengeData?.current_round || sessionRound;
 
-      // update local score too (optional)
-      setSessionScore((prev) => prev + score);
+    // 1) ارفع نتيجتي (مبدئيًا بدون is_round_winner)
+    await supabase.from("challenge_results").upsert({
+      challenge_id: challengeId,
+      round,
+      player_id: playerId,
+      name: playerName || "لاعب",
+      tries,
+      won: !!win,
+      duration_sec: durationSec,
+      score,
+      is_round_winner: false
+    });
 
-      const round = challengeData?.current_round || sessionRound;
+    // 2) لو أنا فزت بالكلمة: أحاول أكون "أول واحد" يقفل الراوند
+    if (win) {
+      const { data: updated } = await supabase
+        .from("challenges")
+        .update({
+          round_winner_player_id: playerId,
+          round_winner_name: playerName || "لاعب",
+          round_ended_at: new Date().toISOString()
+        })
+        .eq("id", challengeId)
+        .is("round_winner_player_id", null)   // شرط: ما فيه فائز قبلي
+        .eq("status", "running")              // شرط: الراوند شغال
+        .select()
+        .maybeSingle();
 
-      await supabase.from("challenge_results").upsert({
-        challenge_id: challengeId,
-        round,
-        player_id: playerId,
-        name: playerName || "لاعب",
-        tries,
-        won: !!win,
-        duration_sec: durationSec,
-        score,
-      });
+      // إذا أنا فعلاً أول واحد (تم التحديث)
+      if (updated) {
+        // علّم نتيجتي كفائز الراوند
+        await supabase
+          .from("challenge_results")
+          .update({ is_round_winner: true })
+          .eq("challenge_id", challengeId)
+          .eq("round", round)
+          .eq("player_id", playerId);
 
-      // if everyone finished? (اختياري بسيط: نخليها finished اذا كل اللاعبين عندهم نتيجة)
-      try {
-        const pls = await fetchPlayers(challengeId);
-        const res = await fetchResults(challengeId, round);
-        if (pls.length > 0 && res.length >= pls.length) {
-          await supabase
-            .from("challenges")
-            .update({ status: "finished" })
-            .eq("id", challengeId);
+        // تحقق إذا وصلت 5 فوز -> نهاية المباراة
+        const scores = await fetchMatchScores(challengeId);
+        const me = scores.find(s => s.player_id === playerId);
+        const target = updated.match_target_wins || 5;
+
+        if ((me?.wins || 0) >= target) {
+          await supabase.from("challenges").update({
+            status: "match_over",
+            match_winner_player_id: playerId,
+            match_winner_name: playerName || "لاعب"
+          }).eq("id", challengeId);
+        } else {
+          // غير كذا: خلّي الراوند ينتهي ويعرض للكل
+          await supabase.from("challenges").update({ status: "round_over" }).eq("id", challengeId);
         }
-      } catch {}
+      }
+    } else {
+      // لو خسرت، نخلي الراوند يستنى الفائز الحقيقي (أول واحد حل)
+      // وما نغير status هنا
+    }
+  };
 
-      setPhase("finished");
-    };
-
-    submit();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [gameOver]);
-
+  submit();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, [gameOver]);
   // ====== Create challenge ======
   const createChallenge = async () => {
     const client = supabase;
@@ -680,30 +741,27 @@ export default function App() {
       .eq("id", challengeId);
   };
 
-  const rematchSameLink = async () => {
-    if (!challengeId || !supabase) return;
-    if (!isHost) {
-      showToast("فقط المضيف يقدر يسوي إعادة تحدّي 👑");
-      return;
-    }
+const nextRoundSameLink = async () => {
+  if (!challengeId || !supabase) return;
+  if (!isHost) return showToast("فقط المضيف 👑");
 
-    const len = challengeData?.length || currentWordLength;
-    const list = DICTIONARY[len];
-    const newWord = list[Math.floor(Math.random() * list.length)];
+  const len = challengeData?.length || currentWordLength;
+  const list = DICTIONARY[len];
+  const newWord = list[Math.floor(Math.random() * list.length)];
 
-    await supabase
-      .from("challenges")
-      .update({
-        word: newWord,
-        length: len,
-        status: "lobby",
-        starts_at: null,
-        current_round: (challengeData?.current_round || sessionRound) + 1,
-      })
-      .eq("id", challengeId);
+  await supabase.from("challenges").update({
+    word: newWord,
+    length: len,
+    status: "lobby",
+    starts_at: null,
+    current_round: (challengeData?.current_round || sessionRound) + 1,
+    round_winner_player_id: null,
+    round_winner_name: null,
+    round_ended_at: null
+  }).eq("id", challengeId);
 
-    showToast("تم تجهيز جولة جديدة! 🔁");
-  };
+  showToast("راوند جديد جاهز 🔁");
+};
 
   // ====== Solo length change behavior ======
   useEffect(() => {
@@ -722,7 +780,9 @@ export default function App() {
       return b.score - a.score;
     });
   }, [results]);
-
+const [matchScores, setMatchScores] = useState([]); // [{player_id,name,wins}]
+const [roundWinner, setRoundWinner] = useState(null); // {player_id,name}
+const [matchWinner, setMatchWinner] = useState(null); // {player_id,name}
   // ====== UI render guards ======
   if (isLoading) {
     return (
